@@ -1,0 +1,495 @@
+from __future__ import print_function
+#%matplotlib inline
+
+import random
+import torch
+import torch.nn as nn
+import torch.nn.parallel
+import torch.optim as optim
+import torch.utils.data
+import torchvision.datasets as dset
+import torchvision.transforms as transforms
+import torchvision.utils as vutils
+import numpy as np
+
+from PIL import Image
+
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from mpl_toolkits.axes_grid1 import ImageGrid
+
+from IPython.display import HTML
+
+import wandb
+
+# Set random seed for reproducibility
+manualSeed = 999
+#manualSeed = random.randint(1, 10000) # use if you want new results
+print("Random Seed: ", manualSeed)
+random.seed(manualSeed)
+torch.manual_seed(manualSeed)
+
+
+"""
+The original example is hardcoded to 64x64 images.
+
+    Information on addressing large image size:
+    https://github.com/pytorch/examples/issues/70
+    
+    Training suggestions:
+    https://github.com/soumith/ganhacks
+    
+    Other GAN models
+    https://chainer-colab-notebook.readthedocs.io/en/latest/notebook/official_example/dcgan.html
+    https://github.com/lucidrains/unet-stylegan2
+    https://github.com/boschresearch/unetgan
+"""
+
+
+
+
+
+# Root directory for dataset
+dataroot = "/home/ladvien/deep_arcane/images/data/"
+output_folder = "/home/ladvien/Desktop/deep_arcane/"
+
+# Number of WORKERS for dataloader
+WORKERS = 12
+
+# Batch size during training
+BATCH_SIZE = 4
+
+# Spatial size of training images. All images will be resized to this
+#   size using a transformer.
+IMAGE_SIZE = 128
+
+# Number of channels in the training images. For color images this is 3
+NC = 1
+
+# Size of z latent vector (i.e. size of generator input)
+NZ = 20
+
+# Size of feature maps in generator
+NGF = 64
+
+# Size of feature maps in discriminator
+NDF = 64
+
+# Number of training epochs
+EPOCHS = 5000
+
+# Learning rate for optimizers
+lr = 0.0002
+
+# Beta1 hyperparam for Adam optimizers
+beta1 = 0.5
+
+G_DROPOUT = 0.3
+D_DROPOUT = 0.3
+
+# Labels
+real_range = (0.9, 0.7)
+fake_range = (0.0, 0.0)
+
+# Number of GPUs available. Use 0 for CPU mode.
+ngpu = 1
+
+experiment_settings = {
+    "dataroot": dataroot,
+    "WORKERS": WORKERS,
+    "BATCH_SIZE": BATCH_SIZE,
+    "IMAGE_SIZE":IMAGE_SIZE,
+    "NC":NC,
+    "NZ":NZ,
+    "NGF":NGF,
+    "NDF":NDF,
+    "EPOCHS":EPOCHS,
+    "lr":lr,
+    "beta1":beta1,
+    "G_DROPOUT":G_DROPOUT,
+    "D_DROPOUT":D_DROPOUT,
+    "real_range":real_range,
+    "fake_range":fake_range,
+    "ngpu":ngpu,    
+}
+
+wandb.init(config=experiment_settings, project="deep-arcane")
+
+if NC == 1:
+    normalize = transforms.Normalize((0.5), (0.5))
+else:
+    normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+
+# We can use an image folder dataset the way we have it setup.
+# Create the dataset
+dataset = dset.ImageFolder(root=dataroot,
+                           transform=transforms.Compose([
+                               transforms.Grayscale(num_output_channels=NC),
+                               # transforms.Resize(IMAGE_SIZE),
+                               # transforms.CenterCrop(IMAGE_SIZE),
+                               transforms.ToTensor(),
+                               normalize,
+                           ]))
+
+print(f"Found {len(dataset.imgs)} images in {dataroot}")
+
+# Create the dataloader
+dataloader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE,
+                                         shuffle=True, num_workers=WORKERS)
+
+# Decide which device we want to run on
+device = torch.device("cuda:0" if (torch.cuda.is_available() and ngpu > 0) else "cpu")
+
+# Plot some training images
+real_batch = next(iter(dataloader))
+plt.figure(figsize=(8,8))
+plt.axis("off")
+plt.title("Training Images")
+plt.imshow(np.transpose(vutils.make_grid(real_batch[0].to(device)[:64], padding=2, normalize=True).cpu(),(1,2,0)))
+
+
+
+##################
+# Display Methods
+#################
+def display_generated_images(tensor):
+    images = []
+    for i in range(0, tensor.shape[0]):
+        image = tensor[i].detach().cpu().reshape(128, 128, 1)
+        images.append(image)
+        plt.axis("off")
+        plt.imshow(image, cmap="gray")
+        plt.show()
+    return images
+
+def create_display_grid(images):
+    grid_size = round(len(images) / 4)
+    f, axarr = plt.subplots(grid_size, grid_size)
+    
+    index = 0
+    for row in range(0, grid_size):
+        for col in range(0, grid_size):
+            if index <= len(images):
+                axarr[row,col].imshow(images[index], cmap="gray")
+                axarr[row,col].axis('off')
+                index += 1
+    plt.tight_layout()
+    plt.show()
+    
+def convert_tensor_to_image(image, width, height):
+    image = Image.fromarray(image.detach().cpu().numpy().reshape([width, height]) * 255)
+    plt.imshow(image)
+    color_img = Image.new("RGB", image.size)
+    color_img.paste(image)
+    return color_img
+    
+#############
+# Models
+#############
+
+# custom weights initialization called on netG and netD
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        # nn.init.normal_(m.weight.data, 0.0, 0.02)
+        nn.init.xavier_uniform_(m.weight)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
+        
+        
+# Generator Code
+
+class Generator(nn.Module):
+    def __init__(self, ngpu, dropout):
+        super(Generator, self).__init__()
+        self.ngpu = ngpu
+        self.dropout = dropout
+        self.main = nn.Sequential(
+            # input is Z, going into a convolution
+            nn.ConvTranspose2d(     NZ, NGF * 16, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(NGF * 16),
+            nn.Dropout2d(p=dropout),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (NGF*16) x 4 x 4
+            nn.ConvTranspose2d(NGF * 16, NGF * 8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(NGF * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (NGF*8) x 8 x 8
+            nn.ConvTranspose2d(NGF * 8, NGF * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(NGF * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (NGF*4) x 16 x 16 
+            nn.ConvTranspose2d(NGF * 4, NGF * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(NGF * 2),
+            nn.Dropout2d(p=dropout),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (NGF*2) x 32 x 32
+            nn.ConvTranspose2d(NGF * 2,     NGF, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(NGF),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (NGF) x 64 x 64
+            nn.ConvTranspose2d(    NGF,      NC, 4, 2, 1, bias=False),
+            nn.Tanh()
+            # state size. (NC) x 128 x 128
+        )
+
+    def forward(self, input):
+        return self.main(input)
+    
+    
+# Create the generator
+netG = Generator(ngpu, G_DROPOUT).to(device)
+
+# Handle multi-gpu if desired
+if (device.type == 'cuda') and (ngpu > 1):
+    netG = nn.DataParallel(netG, list(range(ngpu)))
+
+# Apply the weights_init function to randomly initialize all weights
+#  to mean=0, stdev=0.2.
+netG.apply(weights_init)
+
+# Print the model
+print(netG)
+
+
+class Discriminator(nn.Module):
+    def __init__(self, ngpu, dropout):
+        super(Discriminator, self).__init__()
+        self.ngpu = ngpu
+        self.kernel_size = 2
+        
+        self.output_0 = 32
+        self.output_1 = 64
+        self.output_2 = 128
+        self.output_3 = 256
+        self.output_4 = 1
+
+        self.input_1 = self.output_0
+        self.input_2 = self.output_1
+        self.input_3 = self.output_2
+        self.input_4 = self.output_3
+        
+        self.stride_0 = 3
+        self.stride_1 = 3
+        self.stride_2 = 2
+        self.stride_3 = 2
+        self.stride_4 = 2
+        
+        self.padding_0 = 1
+        self.padding_1 = 1
+        self.padding_2 = 1
+        self.padding_3 = 1
+        self.padding_4 = 1
+        
+        
+        self.main = nn.Sequential(
+
+            # input is (NC) x 128 x 128
+            nn.Conv2d(NC, NDF, 4, stride=2, padding=1, bias=False), 
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (NDF) x 64 x 64
+            nn.Conv2d(NDF, NDF * 2, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(NDF * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (NDF*2) x 32 x 32
+            nn.Conv2d(NDF * 2, NDF * 4, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(NDF * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (NDF*4) x 16 x 16 
+            nn.Conv2d(NDF * 4, NDF * 8, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(NDF * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (NDF*8) x 8 x 8
+            nn.Conv2d(NDF * 8, NDF * 16, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(NDF * 16),
+            nn.LeakyReLU(0.2, inplace=True),
+            # state size. (NDF*16) x 4 x 4
+            nn.Conv2d(NDF * 16, 1, 4, stride=1, padding=0, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, input):
+        return self.main(input)
+    
+    
+# Create the Discriminator
+netD = Discriminator(ngpu, D_DROPOUT).to(device)
+
+# Handle multi-gpu if desired
+if (device.type == 'cuda') and (ngpu > 1):
+    netD = nn.DataParallel(netD, list(range(ngpu)))
+
+# Apply the weights_init function to randomly initialize all weights
+#  to mean=0, stdev=0.2.
+netD.apply(weights_init)
+
+# Print the model
+print(netD)
+
+# Log metrics with wandb
+wandb.watch([netG, netD])
+
+# Initialize BCELoss function
+criterion = nn.BCELoss(reduction="mean")
+
+# Create batch of latent vectors that we will use to visualize
+#  the progression of the generator
+fixed_noise = torch.randn(IMAGE_SIZE, NZ, 1, 1, device=device)
+
+# Setup Adam optimizers for both G and D
+optimizerD = optim.Adam(netD.parameters(), lr=lr, betas=(beta1, 0.999))
+optimizerG = optim.Adam(netG.parameters(), lr=lr, betas=(beta1, 0.999))
+
+
+# Training Loop
+
+# Lists to keep track of progress
+img_list = []
+G_losses = []
+D_losses = []
+iters = 0
+
+
+#############
+# Test Size
+#############
+
+i, data = next(enumerate(dataloader, 0))
+
+############################
+# (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
+###########################
+real_label = random.uniform(real_range[0], real_range[1])
+fake_label = random.uniform(fake_range[0], fake_range[1])
+
+## Train with all-real batch
+netD.zero_grad()
+# Format batch
+real_cpu = data[0].to(device)
+b_size = real_cpu.size(0)
+label = torch.full((b_size,), real_label, dtype=torch.float, device=device)
+# Forward pass real batch through D
+output = netD(real_cpu).view(-1)
+# Calculate loss on all-real batch
+errD_real = criterion(output, label)
+
+
+##############
+# Train
+##############
+
+print("Starting Training Loop...")
+# For each epoch
+for epoch in range(EPOCHS):
+    # For each batch in the dataloader
+    for i, data in enumerate(dataloader, 0):
+        
+        
+        # Smooth labels.
+        real_label = random.uniform(real_range[0], real_range[1])
+        fake_label = random.uniform(fake_range[0], fake_range[1])
+
+        ############################
+        # (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
+        ###########################
+        ## Train with all-real batch
+        netD.zero_grad()
+        # Format batch
+        real_cpu = data[0].to(device)
+        b_size = real_cpu.size(0)
+        label = torch.full((b_size,), real_label, dtype=torch.float, device=device)
+        # Forward pass real batch through D
+        output = netD(real_cpu).view(-1)
+        # Calculate loss on all-real batch
+        errD_real = criterion(output, label)
+        
+        # Calculate gradients for D in backward pass
+        errD_real.backward()
+        D_x = output.mean().item()
+
+        ## Train with all-fake batch
+        # Generate batch of latent vectors
+        noise = torch.randn(b_size, NZ, 1, 1, device=device)
+        # Generate fake image batch with G
+        fake = netG(noise)
+        label.fill_(fake_label)
+        # Classify all fake batch with D
+        output = netD(fake.detach()).view(-1)
+        # Calculate D's loss on the all-fake batch
+        errD_fake = criterion(output, label)
+        # Calculate the gradients for this batch
+        errD_fake.backward()
+        D_G_z1 = output.mean().item()
+        # Add the gradients from the all-real and all-fake batches
+        errD = errD_real + errD_fake
+        # Update D
+        optimizerD.step()
+
+        ############################
+        # (2) Update G network: maximize log(D(G(z)))
+        ###########################
+        netG.zero_grad()
+        label.fill_(real_label)  # fake labels are real for generator cost
+        # Since we just updated D, perform another forward pass of all-fake batch through D
+        output = netD(fake).view(-1)
+        # Calculate G's loss based on this output
+        errG = criterion(output, label)
+        # Calculate gradients for G
+        errG.backward()
+        D_G_z2 = output.mean().item()
+        # Update G
+        optimizerG.step()
+
+        # Output training stats
+        if i % 50 == 0:
+            print('[%d/%d][%d/%d]\tLoss_D: %.4f\tLoss_G: %.4f\tD(x): %.4f\tD(G(z)): %.4f / %.4f'
+                  % (epoch, EPOCHS, i, len(dataloader),
+                      errD.item(), errG.item(), D_x, D_G_z1, D_G_z2))
+            wandb.log({"epoch": epoch, "step": i, "D_x": D_x, "D_G_z1": D_G_z1, "D_G_z2": D_G_z2})
+            
+
+        # Save Losses for plotting later
+        G_losses.append(errG.item())
+        D_losses.append(errD.item())
+
+        # Check how the generator is doing by saving G's output on fixed_noise
+        if (iters % 500 == 0) or ((epoch == EPOCHS-1) and (i == len(dataloader)-1)):
+            with torch.no_grad():
+                fake = netG(fixed_noise).detach().cpu()
+            img_list.append(vutils.make_grid(fake, padding=2, normalize=True))
+
+        iters += 1
+
+    if (epoch % 10 == 0):
+        noise = torch.randn(b_size, NZ, 1, 1, device=device)
+        generated_images = netG(noise)
+        images = display_generated_images(generated_images)
+        pil_images = [convert_tensor_to_image(image, IMAGE_SIZE, IMAGE_SIZE) for image in images]       
+        wandb.log({"example": [wandb.Image(img) for img in pil_images]})
+
+        
+fig = plt.figure(figsize=(8,8))
+plt.axis("off")
+ims = [[plt.imshow(np.transpose(i,(1,2,0)), animated=True)] for i in img_list]
+ani = animation.ArtistAnimation(fig, ims, interval=1000, repeat_delay=1000, blit=True)
+
+HTML(ani.to_jshtml())
+
+###################
+# Generate Output
+###################
+
+
+
+noise = torch.randn(b_size, NZ, 1, 1, device=device)
+generated_images = netG(noise)
+images = display_generated_images(generated_images)
+
+create_display_grid(images)
+
+
+
+
+
+
